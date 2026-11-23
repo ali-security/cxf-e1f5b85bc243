@@ -1,0 +1,98 @@
+name: seal-build
+
+# Authored for the sealed build: upstream CXF 2.7.x has no GitHub Actions CI.
+# Mirrors BUILDING.txt (JDK + Maven 3, plain `mvn` runs the tests) scoped to the
+# cxf-rt-transports-http module, plus the systests/transports HTTPS tests that
+# exercise HttpsURLConnectionFactory / hostname verification end to end.
+# JDK 7 matches the release toolchain (reference jar Build-Jdk 1.7.0_71,
+# compiled with cxf.jdk.version=1.6).
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      MAVEN_OPTS: "-Xmx3g -XX:MaxPermSize=512m -Dhttps.protocols=TLSv1.2"
+      # Release attachments (javadoc/source/gpg) and non-test QA gates
+      # (checkstyle/pmd) are not part of the jar or of the test suite.
+      SKIPS: "-Djava.awt.headless=true -Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dgpg.skip=true -Dcheckstyle.skip=true -Dpmd.skip=true -Dcpd.skip=true -Dinvoker.skip=true"
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/setup-java can no longer resolve Java 7 (Azul's metadata API
+      # dropped it), so install the last Zulu 7 build straight from Azul's CDN.
+      - name: Install JDK 7 (Zulu 7u352)
+        run: |
+          curl -sSfL https://cdn.azul.com/zulu/bin/zulu7.56.0.11-ca-jdk7.0.352-linux_x64.tar.gz | tar xz -C "$RUNNER_TEMP"
+          JDK="$RUNNER_TEMP/zulu7.56.0.11-ca-jdk7.0.352-linux_x64"
+          # Late JDK 7 updates restrict JAXP external schema access by default;
+          # 7u71 (the release JDK) did not. cxf-codegen-plugin forks its own JVM
+          # for wsdl2java, so set the old default JDK-wide (xjc loads xjc.xsd).
+          echo "javax.xml.accessExternalSchema=all" >> "$JDK/jre/lib/jaxp.properties"
+          echo "javax.xml.accessExternalDTD=all" >> "$JDK/jre/lib/jaxp.properties"
+          echo "JAVA_HOME=$JDK" >> "$GITHUB_ENV"
+          echo "$JDK/bin" >> "$GITHUB_PATH"
+
+      - name: Install Maven 3.3.9
+        run: |
+          curl -sSfL https://archive.apache.org/dist/maven/maven-3/3.3.9/binaries/apache-maven-3.3.9-bin.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.3.9/bin" >> "$GITHUB_PATH"
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-mirror</id>
+                <mirrorOf>*</mirrorOf>
+                <url>https://repo.maven.apache.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+
+      - name: Build dependencies (install, no tests)
+        run: |
+          java -version
+          mvn -v
+          mvn -B -e clean install \
+            -pl rt/transports/http,systests/transports -am -DskipTests $SKIPS
+
+      - name: Test cxf-rt-transports-http and package the jar
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            mvn -B -e install -pl rt/transports/http \
+              "-Dtest=$TEST_FILTER" -DfailIfNoTests=false $SKIPS
+          else
+            mvn -B -e install -pl rt/transports/http $SKIPS
+          fi
+
+      - name: Test HTTPS systests (systests/transports)
+        if: ${{ inputs.test-filter == '' }}
+        run: |
+          mvn -B -e test -pl systests/transports \
+            '-Dtest=HTTPSClientTest,CertConstraintsTest,HostnameVerification*Test' \
+            -DfailIfNoTests=false $SKIPS
+
+      - name: Test summary (per module, with skip reasons)
+        if: always()
+        run: python3 .github/workflows/seal-surefire-summary.py rt/transports/http systests/transports
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cxf-rt-transports-http
+          path: |
+            rt/transports/http/target/cxf-rt-transports-http-*.jar
+            !rt/transports/http/target/*-tests.jar
+            !rt/transports/http/target/*-sources.jar
+            !rt/transports/http/target/*-javadoc.jar
+          if-no-files-found: error
